@@ -50,7 +50,8 @@ namespace DirectPackageInstaller.Host
                 await Task.Delay(100);
             }
 
-            if (Queue.Count == 0) {
+            if (Queue.Count == 0)
+            {
                 ServiceSocket?.Dispose();
                 ServiceSocket = null;
                 ServerRunning = false;
@@ -59,7 +60,7 @@ namespace DirectPackageInstaller.Host
 
 
             var PKGInfoSocket = Queue.Dequeue();
-            
+
             ClientRunning = Queue.Count > 0;
 
             var UrlData = Encoding.UTF8.GetBytes(URL);
@@ -76,7 +77,7 @@ namespace DirectPackageInstaller.Host
 
             //1 = New Package, 0 = Service Exit
             PKGInfoBuffer.AddRange(BitConverter.GetBytes(1u));
-            
+
             PKGInfoBuffer.AddRange(BitConverter.GetBytes(UrlData.Length));
             PKGInfoBuffer.AddRange(UrlData);
             PKGInfoBuffer.AddRange(BitConverter.GetBytes(NameData.Length));
@@ -98,16 +99,19 @@ namespace DirectPackageInstaller.Host
                 PKGInfoBuffer.AddRange(IconData);
             }
 
+            TaskCompletionSource SendTask = new TaskCompletionSource();
+
             SocketAsyncEventArgs PkgInfoEvent = new SocketAsyncEventArgs();
             PkgInfoEvent.RemoteEndPoint = PKGInfoSocket.RemoteEndPoint;
             PkgInfoEvent.SetBuffer(PKGInfoBuffer.ToArray());
-            PkgInfoEvent.Completed += (sender, e) =>
-            {
-                PKGInfoSocket.Close();
-                PayloadSocket?.Close();
-            };
+            PkgInfoEvent.Completed += (sender, e) => ReturnToQueue(PKGInfoSocket, PkgInfoEvent, SendTask);
 
-            PKGInfoSocket.SendAsync(PkgInfoEvent);
+            if (!PKGInfoSocket.SendAsync(PkgInfoEvent))
+            {
+                ReturnToQueue(PKGInfoSocket, PkgInfoEvent, SendTask);
+            }
+
+            await SendTask.Task;
 
             if (!Silent)
                 await MessageBox.ShowAsync("Package Sent!", "DirectPackageInstaller", MessageBoxButtons.OK, MessageBoxIcon.Information);
@@ -136,14 +140,12 @@ namespace DirectPackageInstaller.Host
                     SocketAsyncEventArgs ConnectionEvent = new SocketAsyncEventArgs();
                     ConnectionEvent.RemoteEndPoint = Connection.RemoteEndPoint;
                     ConnectionEvent.SetBuffer(new byte[4]);
-                    ConnectionEvent.Completed += (sender, e) =>
-                    {
-                        Connection.Close();
-                        PayloadSocket?.Close();
-                        Source.SetResult();
-                    };
+                    ConnectionEvent.Completed += (sender, e) => CloseAndDispose(Connection, ConnectionEvent, Source);
 
-                    Connection.SendAsync(ConnectionEvent);
+                    if (!Connection.SendAsync(ConnectionEvent))
+                    {
+                        CloseAndDispose(Connection, ConnectionEvent, Source);
+                    }
                 }
                 catch
                 {
@@ -155,7 +157,7 @@ namespace DirectPackageInstaller.Host
 
             ClientRunning = false;
         }
-        
+
         /// <summary>
         /// Tries to connect the PayloadSocket at the GoldHEN/MiraLoader payload port
         /// </summary>
@@ -167,12 +169,12 @@ namespace DirectPackageInstaller.Host
             int[] Ports = new int[] { 9090, 9021, 9020 };
             foreach (var Port in Ports)
             {
-                PayloadSocket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
-                PayloadSocket.ReceiveTimeout = 3000;
-                PayloadSocket.SendTimeout = 3000;
-                PayloadSocket.NoDelay = true;
+                var socket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+                socket.ReceiveTimeout = 3000;
+                socket.SendTimeout = 3000;
+                socket.NoDelay = true;
 
-                CancellationTokenSource CToken = new CancellationTokenSource();
+                using CancellationTokenSource CToken = new CancellationTokenSource();
                 CToken.CancelAfter(3000);
 
                 try
@@ -180,25 +182,33 @@ namespace DirectPackageInstaller.Host
                     var Endpoint = new IPEndPoint(IPAddress.Parse(IP), Port);
 
                     if (App.IsAndroid)
-                        PayloadSocket.Connect(Endpoint);
+                        socket.Connect(Endpoint);
                     else
-                        await PayloadSocket.ConnectAsync(Endpoint);
-                    break;
+                        await socket.ConnectAsync(Endpoint, CToken.Token);
+
+                    if (socket.Connected)
+                    {
+                        PayloadSocket = socket;
+                        return true;
+                    }
                 }
-                catch (Exception ex) {
+                catch (Exception ex)
+                {
 #if DEBUG
                     await MessageBox.ShowAsync("try conn err \n" + ex.ToString());
 #endif
                 }
+
+                socket.Dispose();
             }
 
-            if (!PayloadSocket!.Connected && Retry)
+            if (Retry)
             {
                 await Task.Delay(3000);
                 return await TryConnectSocket(IP, false);
             }
 
-            return PayloadSocket.Connected;
+            return false;
         }
 
         /// <summary>
@@ -287,7 +297,7 @@ namespace DirectPackageInstaller.Host
                     ClientRunning = Queue.Count > 0;
                     CToken.Dispose();
                 }
-                
+
             } while (ServerRunning);
 
             ServiceSocket?.Close();
@@ -320,7 +330,7 @@ namespace DirectPackageInstaller.Host
 
             if (ClientSocket == null)
                 throw new NullReferenceException(nameof(ClientSocket));
-            
+
             return ClientSocket;
         }
 
@@ -348,7 +358,7 @@ namespace DirectPackageInstaller.Host
 
             try
             {
-                ushort LocalPort = (ushort)((IPEndPoint)ServiceSocket.LocalEndPoint).Port;
+                ushort LocalPort = (ushort)((IPEndPoint)ServiceSocket.LocalEndPoint!).Port;
 
                 var IP = IPAddress.Parse(PCIP).GetAddressBytes();
                 var Port = BitConverter.GetBytes(LocalPort).Reverse().ToArray();
@@ -360,20 +370,57 @@ namespace DirectPackageInstaller.Host
 
                 if (PayloadSocket.Send(Payload) != Payload.Length)
                     return false;
-
-                SocketAsyncEventArgs DisconnectEvent = new SocketAsyncEventArgs();
-                DisconnectEvent.RemoteEndPoint = PayloadSocket.RemoteEndPoint;
-
-                PayloadSocket.Disconnect(false);
-                PayloadSocket.Close();
-
             }
             catch (Exception ex)
             {
                 return false;
             }
+            finally
+            {
+                if (PayloadSocket != null)
+                {
+                    try { PayloadSocket.Shutdown(SocketShutdown.Both); } catch { }
+                    PayloadSocket.Close();
+                    PayloadSocket = null;
+                }
+            }
 
             return true;
+        }
+
+        private void ReturnToQueue(Socket socket, SocketAsyncEventArgs e, TaskCompletionSource? tcs = null)
+        {
+            if (socket.Connected)
+            {
+                Queue.Enqueue(socket);
+                ClientRunning = true;
+            }
+            else
+            {
+                socket.Close();
+                ClientRunning = Queue.Count > 0;
+            }
+
+            e.Dispose();
+
+            if (tcs != null)
+                tcs.TrySetResult();
+        }
+
+        private void CloseAndDispose(Socket socket, SocketAsyncEventArgs e, TaskCompletionSource? tcs = null)
+        {
+            try
+            {
+                if (socket.Connected)
+                    socket.Shutdown(SocketShutdown.Both);
+            }
+            catch { }
+
+            socket.Close();
+            e.Dispose();
+
+            if (tcs != null)
+                tcs.TrySetResult();
         }
     }
 }
