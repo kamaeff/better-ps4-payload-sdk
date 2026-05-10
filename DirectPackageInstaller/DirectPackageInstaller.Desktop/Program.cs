@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.IO;
 using System.Linq;
 using System.Runtime.InteropServices;
@@ -109,6 +109,12 @@ namespace DirectPackageInstaller.Desktop
                     case "progress":
                         ShowProgress = true;
                         break;
+                    case "selftest":
+                        if (i + 1 >= args.Length)
+                            goto case "help";
+                        RunSelfTest(args[++i]);
+                        Console.ReadKey();
+                        return;
                     case "help":
                     case "h":
                     case "?":
@@ -441,5 +447,68 @@ namespace DirectPackageInstaller.Desktop
             => AppBuilder.Configure<App>()
                 .UsePlatformDetect()
                 .LogToTrace();
+
+        static void RunSelfTest(string url)
+        {
+            Console.WriteLine("Running SegmentedStream Self-Test on: " + url);
+            
+            using var sha256 = System.Security.Cryptography.SHA256.Create();
+            byte[] buf = new byte[65536];
+
+            Console.WriteLine("\n--- Pass 1: Direct Download ---");
+            var direct = new FileHostStream(url);
+            long totalSize = direct.Length;
+            Console.WriteLine("Total Size: " + totalSize);
+            
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            long pos = 0;
+            while (pos < totalSize)
+            {
+                int r = direct.Read(buf, 0, buf.Length);
+                if (r == 0) break;
+                sha256.TransformBlock(buf, 0, r, null, 0);
+                pos += r;
+                Console.Write($"\rDownloaded: {pos} / {totalSize}");
+            }
+            sha256.TransformFinalBlock(buf, 0, 0);
+            sw.Stop();
+            var hash1 = BitConverter.ToString(sha256.Hash).Replace("-", "").ToLowerInvariant();
+            var time1 = sw.Elapsed;
+            Console.WriteLine($"\nDirect Time: {time1.TotalSeconds:F2}s, Hash: {hash1}");
+            
+            sha256.Initialize();
+            
+            Console.WriteLine("\n--- Pass 2: Segmented Download ---");
+            var segStream = new SegmentedStream(() => new FileHostStream(url), null, 1024 * 1024, false, 4);
+            
+            sw.Restart();
+            pos = 0;
+            while (pos < totalSize)
+            {
+                int r = segStream.Read(buf, 0, buf.Length);
+                if (r == 0) break;
+                sha256.TransformBlock(buf, 0, r, null, 0);
+                pos += r;
+                Console.Write($"\rDownloaded: {pos} / {totalSize}");
+            }
+            sha256.TransformFinalBlock(buf, 0, 0);
+            sw.Stop();
+            
+            var hash2 = BitConverter.ToString(sha256.Hash).Replace("-", "").ToLowerInvariant();
+            var time2 = sw.Elapsed;
+            Console.WriteLine($"\nSegmented Time: {time2.TotalSeconds:F2}s, Hash: {hash2}");
+            
+            Console.WriteLine("\n--- Results ---");
+            if (hash1 == hash2)
+            {
+                Console.WriteLine("Test Finished! No corruption detected.");
+            }
+            else
+            {
+                Console.WriteLine("CORRUPTION DETECTED: Hashes do not match.");
+            }
+            
+            Console.WriteLine($"Speedup: {time1.TotalSeconds / time2.TotalSeconds:F2}x");
+        }
     }
 }

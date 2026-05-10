@@ -1,9 +1,8 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
-using System.ComponentModel;
-using System.Diagnostics;
 using System.IO;
 using System.Linq;
+using System.Threading;
 using System.Threading.Tasks;
 
 namespace DirectPackageInstaller.IO
@@ -12,336 +11,347 @@ namespace DirectPackageInstaller.IO
     {
         public static int DefaultConcurrency = 4;
         
-        public int BufferSize;
+        public int BufferSize { get; }
+        private readonly bool _closeBuffer;
 
-        private bool CloseBuffer;
+        private readonly Func<Stream> _openSegment;
+        private readonly Func<Stream> _openBuffer;
+        
+        private Stream _readerStream;
+        private readonly Stream _writerStream;
 
-        Func<Stream> OpenBuffer;
-        Stream ReaderStream;
-
-        List<SegmentProcessor> Processors = new List<SegmentProcessor>();
-
-        List<Stream> Streams = new List<Stream>();
-
-        List<VirtualStream> Segments = new List<VirtualStream>();
-        List<long> SegmentProgress = new List<long>();
+        private readonly List<Stream> _streams = new List<Stream>();
+        
+        public int Concurrency { get; }
+        public long TotalSize { get; private set; }
+        
+        private readonly List<Segment> _segments = new List<Segment>();
+        private readonly object _lock = new object();
+        private readonly CancellationTokenSource _cts = new CancellationTokenSource();
+        private readonly List<Task> _tasks = new List<Task>();
+        
+        private class Segment
+        {
+            public long Offset;
+            public long Length;
+            public long Downloaded;
+            public bool IsCompleted => Downloaded >= Length;
+            public Stream BaseStream;
+        }
 
         public long ScanProgress
         {
             get
             {
-                lock (SegmentProgress)
+                lock (_lock)
                 {
-                    long Total = 0;
-                    for (int i = 0; i < SegmentProgress.Count; i++)
+                    long progress = 0;
+                    foreach (var seg in _segments.OrderBy(s => s.Offset))
                     {
-                        var SegId = GetSegmentByOffset(Total);
-                        if (SegId == -1)
-                            return 0;
-                        Total += SegmentProgress[SegId];
-                        if (ReamingSegmentLength(SegId) > 0)
+                        if (seg.Offset > progress)
+                            break;
+                        progress = Math.Max(progress, seg.Offset + seg.Downloaded);
+                        if (!seg.IsCompleted)
                             break;
                     }
-                    return Total;
+                    return progress;
                 }
             }
         }
 
-        public long TotalProgress {
+        public long TotalProgress
+        {
             get
             {
-                lock (SegmentProgress) {
-                    return SegmentProgress.Sum();
+                lock (_lock)
+                {
+                    return _segments.Sum(x => x.Downloaded);
                 }
-            } 
+            }
         }
 
-        public bool InProgess => TotalConcurrency > 0;
-        public bool Finished => TotalProgress >= TotalSize && !InProgess;
+        public bool InProgress => _tasks.Any(t => !t.IsCompleted);
+        public bool InProgess => InProgress; // Alias for backward compatibility
+        public bool Finished => TotalProgress >= TotalSize && !InProgress;
+        public Func<Stream> OpenSegment => _openSegment;
 
-        BackgroundWorker Worker;
-
-        public Func<Stream> OpenSegment { get; private set; }
-
-        public int Concurrency;
-
-        public long TotalSize { get; private set; }
-
-        int Connections => Segments.Select(x => x.Position > 0).Count();
-
-        long TotalBuffered => Segments.Select(x => x.Position).Sum();
-
-        long TotalConcurrency => Segments.Count(x => x.Position < x.Length);
-
-        int BiggestSegment => Segments.Select((x, i) => (Reaming: ReamingSegmentLength(i), ID: i)).MaxBy(x => x.Reaming).ID;
-
-        int? CriticalSegment = null;
-
-        public SegmentedStream(Func<Stream> OpenConnection, Func<Stream> OpenBuffer, int BufferSize = 1024 * 1024, bool CloseBuffer = false, int? Concurrency = null)
+        public SegmentedStream(Func<Stream> openConnection, Func<Stream> openBuffer, int bufferSize = 1024 * 1024, bool closeBuffer = false, int? concurrency = null)
         {
-            Stream Buffer;
-            if (OpenBuffer == null)
-            {
-                var TempFile = TempHelper.GetTempFile(null);
-                
-                if (File.Exists(TempFile))
-                    File.Delete(TempFile);
-                
-                Buffer           = new FileStream(TempFile, FileMode.CreateNew, FileAccess.ReadWrite, FileShare.ReadWrite, BufferSize, TransferTuning.TempFileOptions);
-                OpenBuffer = () => new FileStream(TempFile, FileMode.Open,      FileAccess.ReadWrite, FileShare.ReadWrite, BufferSize, TransferTuning.TempFileOptions);
+            _openSegment = openConnection;
+            _openBuffer = openBuffer;
+            BufferSize = bufferSize;
+            _closeBuffer = closeBuffer;
+            Concurrency = concurrency ?? DefaultConcurrency;
 
-                ReaderStream = OpenBuffer();
+            if (_openBuffer == null)
+            {
+                var tempFile = TempHelper.GetTempFile(null);
+                if (File.Exists(tempFile))
+                    File.Delete(tempFile);
+                
+                _writerStream = new FileStream(tempFile, FileMode.CreateNew, FileAccess.ReadWrite, FileShare.ReadWrite, BufferSize, TransferTuning.TempFileOptions);
             }
             else
             {
-                Buffer = OpenBuffer();
-                ReaderStream = OpenBuffer();
+                _writerStream = _openBuffer();
             }
 
-            Streams.Add(Buffer);
-            Streams.Add(ReaderStream);
+            _streams.Add(_writerStream);
 
-            this.OpenBuffer = OpenBuffer;
+            // Open first connection to get size
+            var firstStream = _openSegment();
+            TotalSize = firstStream.Length;
 
+            if (_writerStream.Length != TotalSize)
+                _writerStream.SetLength(TotalSize);
 
-            this.BufferSize = BufferSize;
-            this.CloseBuffer = CloseBuffer;
-            OpenSegment = OpenConnection;
-            var First = OpenSegment();
+            var firstSegment = new Segment
+            {
+                Offset = 0,
+                Length = TotalSize,
+                Downloaded = 0,
+                BaseStream = firstStream
+            };
 
-            TotalSize = First.Length;
+            _segments.Add(firstSegment);
+
+            StartDownloadTask(firstSegment);
             
-            if (Buffer.Length != TotalSize)
-                Buffer.SetLength(TotalSize);
+            // Start monitor task to spawn more connections
+            Task.Run(MonitorTasksAsync);
+        }
 
-            lock (SegmentProgress)
+        private async Task MonitorTasksAsync()
+        {
+            try
             {
-                Segments.Add(new VirtualStream(new BufferedStream(First, BufferSize), 0, First.Length)
+                while (!_cts.IsCancellationRequested && TotalProgress < TotalSize)
                 {
-                    ForceAmount = true
-                });
-                SegmentProgress.Add(0);
+                    int activeConnections;
+                    Segment bestSegmentToSplit = null;
+
+                    lock (_lock)
+                    {
+                        activeConnections = _segments.Count(s => !s.IsCompleted);
+
+                        if (activeConnections < Concurrency)
+                        {
+                            // Find the segment with the largest remaining bytes
+                            bestSegmentToSplit = _segments
+                                .Where(s => !s.IsCompleted)
+                                .OrderByDescending(s => s.Length - s.Downloaded)
+                                .FirstOrDefault();
+
+                            if (bestSegmentToSplit != null)
+                            {
+                                long remaining = bestSegmentToSplit.Length - bestSegmentToSplit.Downloaded;
+                                if (remaining < 2 * 1024 * 1024) // Only split if more than 2MB remaining
+                                {
+                                    bestSegmentToSplit = null;
+                                }
+                            }
+                        }
+                    }
+
+                    if (bestSegmentToSplit != null)
+                    {
+                        long remaining = bestSegmentToSplit.Length - bestSegmentToSplit.Downloaded;
+                        long splitSize = remaining / 2;
+
+                        long newSegmentOffset;
+                        long newSegmentLength = splitSize;
+                        
+                        lock (_lock)
+                        {
+                            newSegmentOffset = bestSegmentToSplit.Offset + bestSegmentToSplit.Length - splitSize;
+                            bestSegmentToSplit.Length -= splitSize;
+                            
+                            var newSegment = new Segment
+                            {
+                                Offset = newSegmentOffset,
+                                Length = newSegmentLength,
+                                Downloaded = 0
+                            };
+                            _segments.Add(newSegment);
+                            StartDownloadTask(newSegment);
+                        }
+                    }
+
+                    await Task.Delay(500, _cts.Token);
+                }
             }
-
-            this.Concurrency = Concurrency ?? DefaultConcurrency;
-
-            Worker = new BackgroundWorker();
-            Worker.DoWork += ConcurrencyRead;
-            Worker.WorkerSupportsCancellation = true;
-            Worker.RunWorkerAsync();
-
-        }
-
-        ~SegmentedStream()
-        {
-            Close();
-        }
-
-        private async void ConcurrencyRead(object sender, DoWorkEventArgs e)
-        {
-            SegmentBuffer(0, null, 0);
-            while (TotalBuffered < TotalSize && !e.Cancel)
+            catch (OperationCanceledException) { }
+            catch (Exception)
             {
+                Cancel();
+            }
+        }
+
+        private void StartDownloadTask(Segment segment)
+        {
+            var t = Task.Run(() => DownloadSegmentAsync(segment));
+            lock (_lock)
+            {
+                _tasks.Add(t);
+                _tasks.RemoveAll(x => x.IsCompleted);
+            }
+        }
+
+        private async Task DownloadSegmentAsync(Segment segment)
+        {
+            byte[] buffer = new byte[BufferSize];
+
+            while (!_cts.IsCancellationRequested)
+            {
+                long currentLength;
+                lock (_lock) { currentLength = segment.Length; }
+
+                if (segment.Downloaded >= currentLength)
+                    break;
+
+                VirtualStream vStream = null;
                 try
                 {
-                    while (TotalConcurrency < Concurrency && !e.Cancel)
+                    if (segment.BaseStream == null)
                     {
-                        if (Connections < TotalConcurrency)
+                        segment.BaseStream = _openSegment();
+                    }
+
+                    vStream = new VirtualStream(segment.BaseStream, segment.Offset, segment.Length) { ForceAmount = true };
+                    vStream.Position = segment.Downloaded;
+
+                    while (!_cts.IsCancellationRequested)
+                    {
+                        lock (_lock) { currentLength = segment.Length; }
+                        vStream.SetLength(currentLength);
+
+                        if (segment.Downloaded >= currentLength)
                             break;
 
-                        int NextSegment = BiggestSegment;
-                        long Reaming = ReamingSegmentLength(NextSegment); //Segment.Length - Segment.Position
-
-                        long OldReaming = Reaming / 2;
-                        long NewReaming = OldReaming;
-
-                        bool MustAssert = Reaming % 2 != 0;
-
-                        if (MustAssert)
-                            NewReaming += 1;
-
-                        //if (OldReaming + NewReaming != Reaming)
-                        //    break;
-
-                        if (Reaming < 1024 * 1024 * 2)
-                            break;
-
-                        var OldSegment = Segments[NextSegment];
-
-                        long NewSize = OldSegment.Length - NewReaming;
-
-                        long NewSegOffset = OldSegment.FilePos + NewSize;
-
-                        //if (NewSegOffset + NewReaming != OldSegment.Length + OldSegment.FilePos)
-                        //    break;
-
-                        lock (SegmentProgress)
+                        int toRead = (int)Math.Min(buffer.Length, currentLength - segment.Downloaded);
+                        
+                        int read = await vStream.ReadAsync(buffer, 0, toRead, _cts.Token);
+                        
+                        if (read == 0)
                         {
-                            Segments.Add(new VirtualStream(new BufferedStream(OpenSegment(), BufferSize), NewSegOffset, NewReaming)
-                            {
-                                ForceAmount = true
-                            });
-                            SegmentProgress.Add(0);
+                            await Task.Delay(100, _cts.Token);
+                            continue;
                         }
 
-                        
-
-                        SegmentBuffer(Segments.Count() - 1, OldSegment, NewSize);
+                        lock (_lock)
+                        {
+                            _writerStream.Position = segment.Offset + segment.Downloaded;
+                            _writerStream.Write(buffer, 0, read);
+                            segment.Downloaded += read;
+                        }
                     }
-
-                    await Task.Delay(500);
                 }
-                catch
+                catch (OperationCanceledException) { }
+                catch (Exception)
                 {
-                    Cancel();
-                }
-            }
-        }
-
-        int SecondsLost = 0;
-
-        private void SegmentBuffer(int ThisID, Stream? OldSegment, long OldSegmentedNewSize)
-        {
-            int ID = ThisID;
-            var NewBuffer = OpenBuffer();
-            Streams.Add(NewBuffer);
-
-            Stream? OldStream = OldSegment;
-            long OldStreamNewSize = OldSegmentedNewSize;
-            
-            Processors.Add(new SegmentProcessor(Segments[ID], NewBuffer, this, BufferSize, async (Readed) => {
-                lock (SegmentProgress)
-                {
-                    SegmentProgress[ID] += Readed;
-                    
-                    if (OldStream is not null && Readed > 0)
+                    if (!_cts.IsCancellationRequested)
                     {
-                        OldStream.SetLength(OldStreamNewSize);
-                        OldStream = null;
+                        await Task.Delay(2000);
                     }
                 }
-
-                int MaxSeconds = 3;
-                while (CriticalSegment is not null && CriticalSegment != ID && MaxSeconds-- > 0)
+                finally
                 {
-                    await Task.Delay(1000);
+                    vStream?.Dispose();
+                    segment.BaseStream?.Dispose();
+                    segment.BaseStream = null;
                 }
-            }));
-        }
-
-        long ReamingSegmentLength(int ID)
-        {
-            return Segments[ID].Length - Segments[ID].Position;
-        }
-
-        int GetSegmentByOffset(long Offset)
-        {
-            for (int i = 0; i < Segments.Count; i++)
-            {
-                var Segment = Segments[i];
-                if (Segment.FilePos <= Offset && Segment.FilePos + Segment.Length > Offset)
-                    return i;
             }
-
-            return -1;
         }
 
-        (long SegmentOffset, long Ready, long ReadyOffset, int ID) SegmentReadyOffset(int ID)
+        public void Cancel()
         {
-            if (ID == -1)
-                return (-1, -1, -1, -1);
-
-            lock (SegmentProgress)
-            {
-                return (Segments[ID].FilePos, SegmentProgress[ID], Segments[ID].FilePos + SegmentProgress[ID], ID);
-            }
+            _cts.Cancel();
         }
 
         public override bool CanRead => true;
-
         public override bool CanSeek => true;
-
         public override bool CanWrite => false;
-
         public override long Length => TotalSize;
 
-        long CurrentPos = 0;
-        public override long Position { get => CurrentPos; set => CurrentPos = value; }
+        private long _position = 0;
+        public override long Position
+        {
+            get => _position;
+            set => _position = value;
+        }
 
         public override void Flush()
         {
-            ReaderStream?.Flush();
+            lock (_lock)
+            {
+                _writerStream?.Flush();
+            }
         }
 
         public override int Read(byte[] buffer, int offset, int count)
         {
             if (count <= 0)
                 return 0;
-            
-            (long SegmentOffset, long Ready, long ReadyOffset, int ID) ReadyInfo;
-           
-            //We should try stop reading of the lastest downloaded bytes because the Reader stream
-            //can try buffer empty data, when the download is finished then we can allow read it.
-            
-            int AntiBuffering() => Finished ? 0 : BufferSize * 2;
-            
-            (long SegmentOffset, long Ready, long ReadyOffset, int ID) GetCurrentSegmentInfo() => SegmentReadyOffset(GetSegmentByOffset(Position));
 
-            DateTime WaitBegin = DateTime.Now;
-
-            while (((ReadyInfo = GetCurrentSegmentInfo()).ReadyOffset <= Position + AntiBuffering()) || ReadyInfo.ReadyOffset == -1 || Position < ReadyInfo.SegmentOffset)
+            int antiBuffer = Finished ? 0 : BufferSize * 2;
+            
+            while (true)
             {
-                if (ReamingSegmentLength(ReadyInfo.ID) == 0)
+                long scanProgress = ScanProgress;
+                if (scanProgress >= _position + antiBuffer + count)
                 {
                     break;
                 }
 
-                if (ReadyInfo.ReadyOffset == -1)
+                if (Finished || scanProgress == TotalSize)
                 {
-                    Task.Delay(1000).Wait();
-                    
-                    if (GetCurrentSegmentInfo().ReadyOffset == -1)
-                        return 0;
+                    break;
+                }
+                
+                long requestedEnd = _position + count + antiBuffer;
+                bool isReady = false;
+                lock (_lock)
+                {
+                    var seg = _segments.FirstOrDefault(s => s.Offset <= _position && s.Offset + s.Downloaded > _position);
+                    if (seg != null)
+                    {
+                        if (seg.Offset + seg.Downloaded >= requestedEnd || seg.IsCompleted)
+                        {
+                            isReady = true;
+                        }
+                    }
                 }
 
-                if ((DateTime.Now - WaitBegin).TotalSeconds > 10)
-                    CriticalSegment = ReadyInfo.ID;
+                if (isReady)
+                    break;
 
-                Flush();
                 Task.Delay(100).Wait();
             }
 
-            CriticalSegment = null;
-
-            int AntiBuffer = AntiBuffering();
-
-            if (ReamingSegmentLength(ReadyInfo.ID) == 0)
-                AntiBuffer = 0;
-
-            if (Position + count + AntiBuffer > ReadyInfo.ReadyOffset)
+            lock (_lock)
             {
-                count = (int) (ReadyInfo.ReadyOffset - Position) - AntiBuffer;
+                _writerStream.Seek(_position, SeekOrigin.Begin);
                 
-                if (count <= 0)
-                    count = 1;
-            }
+                long maxAvailable = 0;
+                var seg = _segments.FirstOrDefault(s => s.Offset <= _position && s.Offset + s.Downloaded > _position);
+                if (seg != null)
+                {
+                    maxAvailable = (seg.Offset + seg.Downloaded) - _position;
+                    if (!Finished && !seg.IsCompleted)
+                        maxAvailable -= antiBuffer;
+                }
 
-            if (ReaderStream == null)
-            {
-                ReaderStream = OpenBuffer();
-                Streams.Add(ReaderStream);
-            }
-            
+                if (maxAvailable <= 0 && TotalSize > 0 && !Finished)
+                    maxAvailable = 1;
 
-            lock (this)
-            {
-                ReaderStream.Seek(Position, SeekOrigin.Begin);
-                ReaderStream.Flush();
+                if (count > maxAvailable && maxAvailable > 0)
+                    count = (int)maxAvailable;
+                
+                if (count <= 0) return 0;
 
-                int Readed = ReaderStream.Read(buffer, offset, count);
-
-                Position += Readed;
-                return Readed;
+                int read = _writerStream.Read(buffer, offset, count);
+                _position += read;
+                return read;
             }
         }
 
@@ -352,163 +362,31 @@ namespace DirectPackageInstaller.IO
                 case SeekOrigin.Begin:
                     Position = offset;
                     break;
-
                 case SeekOrigin.Current:
                     Position += offset;
                     break;
-
                 case SeekOrigin.End:
                     Position = Length + offset;
                     break;
             }
-
             return Position;
         }
-        
-        public void Cancel()
-        {
-            Worker?.CancelAsync();
-            foreach (var Segment in Processors)
-                Segment.Cancel();
-        }
-        
-        protected override void Dispose(bool Disposing)
+
+        protected override void Dispose(bool disposing)
         {
             Cancel();
             
-            if (CloseBuffer)
+            if (_closeBuffer)
             {
-                ReaderStream?.Close();
-
-                foreach (var Stream in Streams)
-                    Stream?.Close();
-
-                Streams.Clear();
+                foreach (var stream in _streams)
+                    stream?.Close();
+                _streams.Clear();
             }
 
-            base.Dispose(Disposing);
+            base.Dispose(disposing);
         }
 
-        public override void SetLength(long value)
-        {
-            throw new NotImplementedException();
-        }
-
-        public override void Write(byte[] buffer, int offset, int count)
-        {
-            throw new NotImplementedException();
-        }
-    }
-
-    class SegmentProcessor
-    {
-        object Locker;
-
-        long OutputOffset;
-
-        int BufferSize;
-        Stream StreamBuffer;
-
-        Func<int, Task> ProgressCallback;
-        BackgroundWorker Worker;
-
-        VirtualStream Input;
-
-        public SegmentProcessor(VirtualStream Segment, Stream Buffer, object Locker, int BufferSize, Func<int, Task> ProgressCallback)
-        {
-            Input = Segment;
-            StreamBuffer = Buffer;
-            OutputOffset = Input.FilePos;
-
-            this.Locker = Locker;
-            this.BufferSize = BufferSize;
-            this.ProgressCallback = ProgressCallback;
-
-            Worker = new BackgroundWorker();
-            Worker.DoWork += Worker_DoWork;
-            Worker.WorkerSupportsCancellation = true;
-            Worker.RunWorkerAsync();
-        }
-
-        ~SegmentProcessor()
-        {
-            Worker?.CancelAsync();
-        }
-
-        public void Cancel() => Worker?.CancelAsync();
-
-        private async void Worker_DoWork(object sender, DoWorkEventArgs e)
-        {
-            byte[] Buffer = new byte[BufferSize];
-            int Readed;
-
-            long ReadBeginPos = 0;
-            do
-            {
-                try
-                {
-                    ReadBeginPos = Input.Position;
-
-                    Readed = await Input.ReadAsync(Buffer, 0, Buffer.Length);
-
-                    if (e.Cancel)
-                        break;
-
-                    if (StreamBuffer is UnsafeMemoryStream {Disposed: true})
-                        break;
-                    
-                    if (Readed > 0)
-                    {
-                        lock (Locker)
-                        {
-                            long WritePos = OutputOffset + ReadBeginPos;
-
-                            if (StreamBuffer.Position != WritePos)
-                                StreamBuffer.Seek(WritePos, SeekOrigin.Begin);
-                            
-                            StreamBuffer.Write(Buffer, 0, Readed);
-                            StreamBuffer.Flush();
-                        }
-                    }
-
-                    await ProgressCallback(Readed);
-                }
-                catch
-                {
-                    Input.Position = ReadBeginPos;
-                    await Task.Delay(5000);
-                }
-
-            } while (Input.Position < Input.Length && !e.Cancel);
-            
-            if (Input.Base is NetworkStream inputBase)
-                inputBase.CloseConnection();
-
-            Input.Close();
-        }
-    }
-
-    unsafe struct SegmentInfo
-    {
-        public SegmentInfo(long Offset, long Length)
-        {
-            this.Offset = Offset;
-            this.Length = &Length;
-        }
-
-        public long Offset;
-        long* Length;
-
-        public long SafeLength
-        {
-            get
-            {
-                return *Length;
-            }
-            set
-            {
-                *Length = value;
-            }
-        }
+        public override void SetLength(long value) => throw new NotImplementedException();
+        public override void Write(byte[] buffer, int offset, int count) => throw new NotImplementedException();
     }
 }

@@ -26,7 +26,7 @@ namespace DirectPackageInstaller.Tasks
             {
                 var Options = new ReaderOptions() { Password = Pass, DisableCheckIncomplete = true };
 
-                return RarArchive.Open(Parts, Options);
+                return RarArchive.OpenArchive(Parts, Options);
             }
 
             return await CommonDecompress(Volumes, FirstUrl, CreateUnrar, Source.RAR, ProgressChanged, EntryName, Seekable, Password);
@@ -47,7 +47,7 @@ namespace DirectPackageInstaller.Tasks
                     DisableCheckIncomplete = Parts.Length > 1
                 };
 
-                return SevenZipArchive.Open(new MergedStream(Parts), Options);
+                return SevenZipArchive.OpenArchive(new MergedStream(Parts), Options);
             }
 
             return await CommonDecompress(Volumes, FirstUrl, CreateUn7z, Source.SevenZip, ProgressChanged, EntryName, Seekable, Password);
