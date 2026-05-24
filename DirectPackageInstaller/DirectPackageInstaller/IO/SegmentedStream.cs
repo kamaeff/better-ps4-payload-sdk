@@ -391,12 +391,12 @@ namespace DirectPackageInstaller.IO
             }
         }
 
-        public override int Read(byte[] buffer, int offset, int count)
+        public int ReadAt(long position, byte[] buffer, int offset, int count)
         {
             if (count <= 0)
                 return 0;
 
-            long remaining = TotalSize - _position;
+            long remaining = TotalSize - position;
             if (remaining <= 0)
                 return 0;
 
@@ -408,7 +408,7 @@ namespace DirectPackageInstaller.IO
 
             while (true)
             {
-                long availableBytes = GetContiguousAvailableBytes(_position, count);
+                long availableBytes = GetContiguousAvailableBytes(position, count);
                 if (availableBytes >= count)
                 {
                     break;
@@ -421,7 +421,7 @@ namespace DirectPackageInstaller.IO
 
                 if (!priorityRequested && DateTime.UtcNow - waitStart >= SlowReadPriorityDelay)
                 {
-                    RequestPrioritySegment(_position + availableBytes);
+                    RequestPrioritySegment(position + availableBytes);
                     priorityRequested = true;
                 }
 
@@ -430,9 +430,9 @@ namespace DirectPackageInstaller.IO
 
             lock (_lock)
             {
-                _writerStream.Seek(_position, SeekOrigin.Begin);
+                _writerStream.Seek(position, SeekOrigin.Begin);
 
-                long maxAvailable = GetContiguousAvailableBytesUnsafe(_position, count);
+                long maxAvailable = GetContiguousAvailableBytesUnsafe(position, count);
 
                 if (count > maxAvailable && maxAvailable > 0)
                     count = (int)maxAvailable;
@@ -440,10 +440,15 @@ namespace DirectPackageInstaller.IO
                 if (count <= 0)
                     return 0;
 
-                int read = _writerStream.Read(buffer, offset, count);
-                _position += read;
-                return read;
+                return _writerStream.Read(buffer, offset, count);
             }
+        }
+
+        public override int Read(byte[] buffer, int offset, int count)
+        {
+            int read = ReadAt(_position, buffer, offset, count);
+            _position += read;
+            return read;
         }
 
         public override long Seek(long offset, SeekOrigin origin)

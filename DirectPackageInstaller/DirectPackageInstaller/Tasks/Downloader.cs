@@ -1,4 +1,4 @@
-﻿using DirectPackageInstaller.IO;
+using DirectPackageInstaller.IO;
 using System;
 using System.Collections.Generic;
 using System.ComponentModel;
@@ -119,7 +119,7 @@ namespace DirectPackageInstaller.Tasks
                     
                     return new FileHostStream(This.Url);
                 }, null);
-                This.OpenRead = () => This.SegmentedRead;
+                This.OpenRead = () => new SegmentedStreamReader(This.SegmentedRead);
             }
             catch (Exception ex)
             {

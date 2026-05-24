@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Collections.Specialized;
 using System.Text.Json;
@@ -272,6 +272,12 @@ namespace DirectPackageInstaller.Host
 
             Stream = new VirtualStream(Stream, 0, Length) { ForceAmount = true, LeaveOpen = true };
 
+#if DEBUG
+            var dumpPath = Path.Combine(App.WorkingDirectory, "CacheDebug.bin");
+            Stream = new DebugDumpStream(Stream, dumpPath);
+            LOG("DEBUG: Writing sent cache data to {0} (Range: {1})", dumpPath, Range?.ToString() ?? "Full");
+#endif
+
             try
             {
                 await SendStream(Context, Stream, Range);
@@ -462,6 +468,11 @@ namespace DirectPackageInstaller.Host
                     Context.Response.Headers["Content-Range"] = $"bytes {rangeStart}-{rangeEnd}/{totalLength}";
 
                     Origin = new VirtualStream(Origin, rangeStart, rangeLength);
+                    LOG("Serving Partial Range: {0}-{1}/{2} (Requested Length: {3})", rangeStart, rangeEnd, totalLength, rangeLength);
+                }
+                else 
+                {
+                    LOG("Serving Full Content: {0} bytes", totalLength);
                 }
 
                 LOG("Response Context: {0}", Context.Request.Url.Full);
