@@ -448,6 +448,22 @@ namespace DirectPackageInstaller.Desktop
                 .UsePlatformDetect()
                 .LogToTrace();
 
+        static bool FillBuffer(Stream stream, byte[] buffer, int count, out int read)
+        {
+            read = 0;
+
+            while (read < count)
+            {
+                int current = stream.Read(buffer, read, count - read);
+                if (current == 0)
+                    break;
+
+                read += current;
+            }
+
+            return read > 0;
+        }
+
         static void RunSelfTest(string url)
         {
             Console.WriteLine("Running SegmentedStream Self-Test on: " + url);
@@ -497,15 +513,75 @@ namespace DirectPackageInstaller.Desktop
             var hash2 = BitConverter.ToString(sha256.Hash).Replace("-", "").ToLowerInvariant();
             var time2 = sw.Elapsed;
             Console.WriteLine($"\nSegmented Time: {time2.TotalSeconds:F2}s, Hash: {hash2}");
+
+            Console.WriteLine("\n--- Pass 3: Read Verification ---");
+            using var verificationDirect = new FileHostStream(url);
+            using var verificationSegmented = new SegmentedStream(() => new FileHostStream(url), null, 1024 * 1024, false, 4);
+            var verifyDirectBuffer = new byte[65536];
+            var verifySegmentedBuffer = new byte[65536];
+            long verified = 0;
+            long mismatchOffset = -1;
+            bool corruptionDetected = false;
+
+            sw.Restart();
+            while (verified < totalSize)
+            {
+                int target = (int)Math.Min(verifyDirectBuffer.Length, totalSize - verified);
+
+                bool hasDirect = FillBuffer(verificationDirect, verifyDirectBuffer, target, out int directRead);
+                bool hasSegmented = FillBuffer(verificationSegmented, verifySegmentedBuffer, target, out int segmentedRead);
+
+                if (hasDirect != hasSegmented || directRead != segmentedRead)
+                {
+                    mismatchOffset = verified + Math.Min(directRead, segmentedRead);
+                    corruptionDetected = true;
+                    Console.WriteLine($"\nRead size mismatch at offset {mismatchOffset} (direct={directRead}, segmented={segmentedRead}).");
+                    break;
+                }
+
+                if (!hasDirect)
+                    break;
+
+                for (int i = 0; i < directRead; i++)
+                {
+                    if (verifyDirectBuffer[i] == verifySegmentedBuffer[i])
+                        continue;
+
+                    mismatchOffset = verified + i;
+                    corruptionDetected = true;
+                    Console.WriteLine($"\nByte mismatch at offset {mismatchOffset} (direct=0x{verifyDirectBuffer[i]:X2}, segmented=0x{verifySegmentedBuffer[i]:X2}).");
+                    break;
+                }
+
+                if (corruptionDetected)
+                    break;
+
+                verified += directRead;
+                Console.Write($"\rVerified: {verified} / {totalSize}");
+            }
+            sw.Stop();
+
+            if (!corruptionDetected && verified != totalSize)
+            {
+                mismatchOffset = verified;
+                corruptionDetected = true;
+                Console.WriteLine($"\nUnexpected EOF at offset {mismatchOffset}.");
+            }
+
+            Console.WriteLine($"\nVerification Time: {sw.Elapsed.TotalSeconds:F2}s");
             
             Console.WriteLine("\n--- Results ---");
-            if (hash1 == hash2)
+            if (hash1 == hash2 && !corruptionDetected)
             {
                 Console.WriteLine("Test Finished! No corruption detected.");
             }
             else
             {
-                Console.WriteLine("CORRUPTION DETECTED: Hashes do not match.");
+                if (hash1 != hash2)
+                    Console.WriteLine("CORRUPTION DETECTED: Hashes do not match.");
+
+                if (corruptionDetected)
+                    Console.WriteLine($"CORRUPTION DETECTED: Read verification failed at offset {mismatchOffset}.");
             }
             
             Console.WriteLine($"Speedup: {time1.TotalSeconds / time2.TotalSeconds:F2}x");

@@ -76,6 +76,8 @@ namespace DirectPackageInstaller
 
         public bool ForceAmount { get; set; } = false;
 
+        public bool LeaveOpen { get; internal set; }
+
         public override int Read(byte[] buffer, int offset, int count)
         {
             long ReadPos = FilePos + Pos;
@@ -167,13 +169,16 @@ namespace DirectPackageInstaller
         protected override void Dispose(bool Disposing)
         {
             Close();
-            Base?.Dispose();
+
+            if (!LeaveOpen)
+                Base?.Dispose();
 
             base.Dispose(Disposing);
         }
 
         public override void Close()
         {
+            if (LeaveOpen) return;
             Base?.Close();
         }
     }

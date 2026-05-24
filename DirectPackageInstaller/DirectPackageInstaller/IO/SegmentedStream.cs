@@ -29,6 +29,9 @@ namespace DirectPackageInstaller.IO
         private readonly object _lock = new object();
         private readonly CancellationTokenSource _cts = new CancellationTokenSource();
         private readonly List<Task> _tasks = new List<Task>();
+        private long? _prioritySegmentOffset;
+
+        private static readonly TimeSpan SlowReadPriorityDelay = TimeSpan.FromSeconds(5);
         
         private class Segment
         {
@@ -128,11 +131,22 @@ namespace DirectPackageInstaller.IO
                 while (!_cts.IsCancellationRequested && TotalProgress < TotalSize)
                 {
                     int activeConnections;
+                    long? priorityOffset = null;
+                    Segment prioritySegmentToStart = null;
                     Segment bestSegmentToSplit = null;
+                    Segment splitSegmentToStart = null;
 
                     lock (_lock)
                     {
                         activeConnections = _segments.Count(s => !s.IsCompleted);
+                        priorityOffset = _prioritySegmentOffset;
+
+                        if (priorityOffset.HasValue && activeConnections < Concurrency + 1)
+                        {
+                            prioritySegmentToStart = CreateSegmentAtOffsetUnsafe(priorityOffset.Value);
+                            _prioritySegmentOffset = null;
+                            activeConnections += prioritySegmentToStart != null ? 1 : 0;
+                        }
 
                         if (activeConnections < Concurrency)
                         {
@@ -153,7 +167,11 @@ namespace DirectPackageInstaller.IO
                         }
                     }
 
-                    if (bestSegmentToSplit != null)
+                    if (prioritySegmentToStart != null)
+                    {
+                        StartDownloadTask(prioritySegmentToStart);
+                    }
+                    else if (bestSegmentToSplit != null)
                     {
                         long remaining = bestSegmentToSplit.Length - bestSegmentToSplit.Downloaded;
                         long splitSize = remaining / 2;
@@ -173,8 +191,11 @@ namespace DirectPackageInstaller.IO
                                 Downloaded = 0
                             };
                             _segments.Add(newSegment);
-                            StartDownloadTask(newSegment);
+                            splitSegmentToStart = newSegment;
                         }
+
+                        if (splitSegmentToStart != null)
+                            StartDownloadTask(splitSegmentToStart);
                     }
 
                     await Task.Delay(500, _cts.Token);
@@ -263,6 +284,88 @@ namespace DirectPackageInstaller.IO
             }
         }
 
+        private Segment CreateSegmentAtOffsetUnsafe(long offset)
+        {
+            if (offset <= 0 || offset >= TotalSize)
+                return null;
+
+            if (_segments.Any(s => !s.IsCompleted && s.Offset == offset))
+                return null;
+
+            var sourceSegment = _segments
+                .Where(s => !s.IsCompleted && s.Offset < offset && offset < s.Offset + s.Length)
+                .OrderBy(s => s.Offset)
+                .FirstOrDefault();
+
+            if (sourceSegment == null)
+                return null;
+
+            long availableEnd = sourceSegment.Offset + sourceSegment.Downloaded;
+            if (offset <= availableEnd)
+                return null;
+
+            long segmentEnd = sourceSegment.Offset + sourceSegment.Length;
+            long newSegmentLength = segmentEnd - offset;
+            if (newSegmentLength <= 0)
+                return null;
+
+            sourceSegment.Length = offset - sourceSegment.Offset;
+
+            var newSegment = new Segment
+            {
+                Offset = offset,
+                Length = newSegmentLength,
+                Downloaded = 0
+            };
+
+            _segments.Add(newSegment);
+            return newSegment;
+        }
+
+        private long GetContiguousAvailableBytesUnsafe(long position, long requestedBytes)
+        {
+            if (requestedBytes <= 0 || position >= TotalSize)
+                return 0;
+
+            long targetEnd = Math.Min(TotalSize, position + requestedBytes);
+            long availableEnd = position;
+
+            while (availableEnd < targetEnd)
+            {
+                var segment = _segments.FirstOrDefault(s => s.Offset <= availableEnd && s.Offset + s.Length > availableEnd);
+                if (segment == null)
+                    break;
+
+                long segmentAvailableEnd = Math.Min(segment.Offset + segment.Downloaded, segment.Offset + segment.Length);
+                if (segmentAvailableEnd <= availableEnd)
+                    break;
+
+                availableEnd = Math.Min(segmentAvailableEnd, targetEnd);
+            }
+
+            return availableEnd - position;
+        }
+
+        private long GetContiguousAvailableBytes(long position, long requestedBytes)
+        {
+            lock (_lock)
+            {
+                return GetContiguousAvailableBytesUnsafe(position, requestedBytes);
+            }
+        }
+
+        private void RequestPrioritySegment(long offset)
+        {
+            if (offset <= 0 || offset >= TotalSize)
+                return;
+
+            lock (_lock)
+            {
+                if (_prioritySegmentOffset == null || offset < _prioritySegmentOffset.Value)
+                    _prioritySegmentOffset = offset;
+            }
+        }
+
         public void Cancel()
         {
             _cts.Cancel();
@@ -293,37 +396,34 @@ namespace DirectPackageInstaller.IO
             if (count <= 0)
                 return 0;
 
-            int antiBuffer = Finished ? 0 : BufferSize * 2;
-            
+            long remaining = TotalSize - _position;
+            if (remaining <= 0)
+                return 0;
+
+            if (count > remaining)
+                count = (int)remaining;
+
+            DateTime waitStart = DateTime.UtcNow;
+            bool priorityRequested = false;
+
             while (true)
             {
-                long scanProgress = ScanProgress;
-                if (scanProgress >= _position + antiBuffer + count)
+                long availableBytes = GetContiguousAvailableBytes(_position, count);
+                if (availableBytes >= count)
                 {
                     break;
                 }
 
-                if (Finished || scanProgress == TotalSize)
+                if (Finished)
                 {
                     break;
-                }
-                
-                long requestedEnd = _position + count + antiBuffer;
-                bool isReady = false;
-                lock (_lock)
-                {
-                    var seg = _segments.FirstOrDefault(s => s.Offset <= _position && s.Offset + s.Downloaded > _position);
-                    if (seg != null)
-                    {
-                        if (seg.Offset + seg.Downloaded >= requestedEnd || seg.IsCompleted)
-                        {
-                            isReady = true;
-                        }
-                    }
                 }
 
-                if (isReady)
-                    break;
+                if (!priorityRequested && DateTime.UtcNow - waitStart >= SlowReadPriorityDelay)
+                {
+                    RequestPrioritySegment(_position + availableBytes);
+                    priorityRequested = true;
+                }
 
                 Task.Delay(100).Wait();
             }
@@ -331,23 +431,14 @@ namespace DirectPackageInstaller.IO
             lock (_lock)
             {
                 _writerStream.Seek(_position, SeekOrigin.Begin);
-                
-                long maxAvailable = 0;
-                var seg = _segments.FirstOrDefault(s => s.Offset <= _position && s.Offset + s.Downloaded > _position);
-                if (seg != null)
-                {
-                    maxAvailable = (seg.Offset + seg.Downloaded) - _position;
-                    if (!Finished && !seg.IsCompleted)
-                        maxAvailable -= antiBuffer;
-                }
 
-                if (maxAvailable <= 0 && TotalSize > 0 && !Finished)
-                    maxAvailable = 1;
+                long maxAvailable = GetContiguousAvailableBytesUnsafe(_position, count);
 
                 if (count > maxAvailable && maxAvailable > 0)
                     count = (int)maxAvailable;
-                
-                if (count <= 0) return 0;
+
+                if (count <= 0)
+                    return 0;
 
                 int read = _writerStream.Read(buffer, offset, count);
                 _position += read;

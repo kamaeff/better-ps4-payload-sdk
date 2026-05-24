@@ -270,7 +270,7 @@ namespace DirectPackageInstaller.Host
                 return;
             }
 
-            Stream = new VirtualStream(Stream, 0, Length) { ForceAmount = true };
+            Stream = new VirtualStream(Stream, 0, Length) { ForceAmount = true, LeaveOpen = true };
 
             try
             {
