@@ -395,7 +395,7 @@ namespace DirectPackageInstaller
         internal static bool IsUnix => (int)Environment.OSVersion.Platform == 4 || (int)Environment.OSVersion.Platform == 6 || (int)Environment.OSVersion.Platform == 128;
 
         public static bool? _IsAndroid;
-        internal static bool IsAndroid => _IsAndroid ??= SelfUpdate.MainExecutable == null;
+        internal static bool IsAndroid => _IsAndroid ??= OperatingSystem.IsAndroid();
         internal static bool IsOSX => RuntimeInformation.IsOSPlatform(OSPlatform.OSX);
         internal static bool IsWindows => RuntimeInformation.IsOSPlatform(OSPlatform.Windows);
 
