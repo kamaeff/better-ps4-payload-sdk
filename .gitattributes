@@ -16,7 +16,7 @@
 *.rtf	 diff=astextplain
 *.RTF	 diff=astextplain
 
-Payload/freebsd-headers/** linguist-vendored
-Payload/lib/** linguist-vendored
-Payload/ps4-libjbc/** linguist-vendored
+freebsd-headers/** linguist-vendored
+lib/** linguist-vendored
+ps4-libjbc/** linguist-vendored
 
