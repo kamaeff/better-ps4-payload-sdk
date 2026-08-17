@@ -1,7 +1,4 @@
 #include <stdarg.h>
-#include <stddef.h>
-#include <stdint.h>
-#include <sys/mman.h>
 #include "../ps4-libjbc/jailbreak.h"
 #include "struct.h"
 
@@ -63,24 +60,29 @@ void printf_notify(char* fmt, ...) {
 	sceKernelSendNotificationRequest(0, (SceNotificationRequest *)&req, sizeof(SceNotificationRequest), 0);
 }
 
+// all the stuff commented out is probably needed for sandbox escaping
+// but idk for me everything was working without it; maybe it's for PKGs only
+// and payloads loaded through GoldHEN payloader are already fine
+// Or maybe the sandbox is just for filesystem io, which I don't use
+// anyway keeping this here (and libjbc itself too) in case it would be useful for anyone
 
-asm("clear_stack:\nmov $0x800,%ecx\nxor %rax, %rax\n.L1:\npush %rax\nloop .L1\nadd $0x4000,%rsp\nret");
-void clear_stack(void);
+// asm("clear_stack:\nmov $0x800,%ecx\nxor %rax, %rax\n.L1:\npush %rax\nloop .L1\nadd $0x4000,%rsp\nret");
+// void clear_stack(void);
 
 
 int main()
 {
-	struct jbc_cred cred;
-	jbc_get_cred(&cred);
-	jbc_jailbreak_cred(&cred);
+	// struct jbc_cred cred;
+	// jbc_get_cred(&cred);
+	// jbc_jailbreak_cred(&cred);
 
-	cred.jdir = 0;
-	cred.sceProcType = 0x3800000000000010;
-	cred.sonyCred = 0x40001c0000000000;
-	cred.sceProcCap = 0x900000000000ff00;
-	jbc_set_cred(&cred);
+	// cred.jdir = 0;
+	// cred.sceProcType = 0x3800000000000010;
+	// cred.sonyCred = 0x40001c0000000000;
+	// cred.sceProcCap = 0x900000000000ff00;
+	// jbc_set_cred(&cred);
 
-	clear_stack();
+	// clear_stack();
 
 	init_libs();
 
