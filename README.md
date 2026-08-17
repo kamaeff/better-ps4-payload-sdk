@@ -4,6 +4,7 @@ Well... I don't speak C or ASM and don't actually understand all the black magic
 I was unable to build a little payload for my project with well-known SceneCollective's ps4-payload-sdk.  
 Then I found DirectPackageInstaller by marcussacana, and the stuff there just did the job for me.  
 At least on my PS4 Slim Baikal 10.01 with the latest GoldHEN.  
+Yeah, it is "better" at least in that sense that it worked for me personally.  
 
 So I decided to clone the `Payload/` part of DirectPackageInstaller to be able to use it as SDK detached from DirectPackageInstaller itself.
 
