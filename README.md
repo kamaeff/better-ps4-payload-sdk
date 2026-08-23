@@ -1,5 +1,12 @@
 # Better PS4 payload SDK
 
+update: looks like it is what originally was in https://github.com/sleirsgoevy/ps4jb-payloads and is currently better maintained in https://github.com/ps4-payload-dev/sdk
+
+I think I'm going to switch my payloads to ps4-payload-dev/sdk and then archive this repo. At some point.
+
+---
+
+
 Well... I don't speak C or ASM and don't actually understand all the black magic happening here.  
 I was unable to build a little payload for my project with well-known SceneCollective's ps4-payload-sdk.  
 Then I found DirectPackageInstaller by marcussacana, and the stuff there just did the job for me.  
